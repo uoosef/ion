@@ -1,8 +1,8 @@
 package util
 
 import (
-	"bytes"
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"net"
 	"runtime"
@@ -22,6 +22,10 @@ import (
 var (
 	localIPPrefix = [...]string{"192.168", "10.0", "169.254", "172.16"}
 )
+
+func GetMID(uid string) string {
+	return fmt.Sprintf("%s#%s", uid, RandStr(6))
+}
 
 func IsLocalIP(ip string) bool {
 	for i := 0; i < len(localIPPrefix); i++ {
@@ -144,11 +148,11 @@ func Val(msg map[string]interface{}, key string) string {
 	if val == nil {
 		return ""
 	}
-	switch val.(type) {
+	switch val := val.(type) {
 	case string:
-		return val.(string)
+		return val
 	case map[string]interface{}:
-		return Marshal(val.(map[string]interface{}))
+		return Marshal(val)
 	default:
 		log.Errorf("util.Val val=%v", val)
 		return ""
@@ -168,22 +172,25 @@ func Map(args ...interface{}) map[string]interface{} {
 }
 
 func GetIDFromRTP(pkt *rtp.Packet) string {
-	if !pkt.Header.Extension || len(pkt.Header.ExtensionPayload) < 36 {
+	if !pkt.Header.Extension || len(pkt.Header.Extensions) == 0 {
 		log.Warnf("pkt invalid extension")
 		return ""
 	}
-	return string(bytes.TrimRight(pkt.Header.ExtensionPayload, "\x00"))
+
+	ext := pkt.GetExtension(1)
+
+	if ext == nil {
+		return ""
+	}
+
+	return string(ext)
 }
 
 func SetIDToRTP(pkt *rtp.Packet, id string) *rtp.Packet {
-	pkt.Header.Extension = true
-
-	//the payload must be in 32-bit words and bigger than extPayload
-	if len(pkt.Header.ExtensionPayload)%4 != 0 || len(pkt.Header.ExtensionPayload) < len(id) {
-		n := 4 * (len(id)/4 + 1)
-		pkt.Header.ExtensionPayload = make([]byte, n)
+	err := pkt.SetExtension(1, []byte(id))
+	if err != nil {
+		log.Errorf("error setting id to rtp extension %+v", err)
 	}
-	copy(pkt.Header.ExtensionPayload, id)
 	return pkt
 }
 
@@ -225,14 +232,6 @@ func IsVideo(pt uint8) bool {
 		return true
 	}
 	return false
-}
-
-func ReadAbsSendTime(pkt *rtp.Packet) (uint32, bool) {
-	if !pkt.Extension && len(pkt.ExtensionPayload) != 3 {
-		log.Errorf("ReadAbsSendTime pkt.Extension=%v len(pkt.Extension)=%d profile=%v", pkt.Extension, len(pkt.ExtensionPayload), pkt.ExtensionProfile)
-		return 0, false
-	}
-	return uint32(pkt.ExtensionPayload[2]) | uint32(pkt.ExtensionPayload[1])<<8 | uint32(pkt.ExtensionPayload[0])<<16, true
 }
 
 func StrToUint8(str string) uint8 {

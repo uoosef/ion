@@ -1,7 +1,6 @@
 package rtc
 
 import (
-	"errors"
 	"sync"
 	"time"
 
@@ -15,195 +14,101 @@ import (
 
 const (
 	maxWriteErr = 100
-	maxSize     = 1024
-	jbPlugin    = "jitterBuffer"
 	liveCycle   = 6 * time.Second
 )
 
-var (
-	errInvalidPlugin = errors.New("plugin is nil")
-)
-
-// Router is a rtp Router
-//                                    +--->sub
-//                                    |
-// pub--->pubCh-->plugin...-->subCh---+--->sub
-//                                    |
-//                                    +--->sub
-
-type rtcpInfo struct {
-	id string
-	rtcp.Packet
-}
-
+//                                      +--->sub
+//                                      |
+// pub--->pubCh-->pluginChain-->subCh---+--->sub
+//                                      |
+//                                      +--->sub
 // Router is rtp router
 type Router struct {
-	pub        transport.Transport
-	subs       map[string]transport.Transport
-	subLock    sync.RWMutex
-	plugins    []plugins.Plugin
-	pluginLock sync.RWMutex
-	pubCh      chan *rtp.Packet
-	subCh      chan *rtp.Packet
-	stop       bool
-	liveTime   time.Time
-	jbRtcpCh   chan rtcp.Packet
-	jbConfig   plugins.JitterBufferConfig
+	pub         transport.Transport
+	subs        map[string]transport.Transport
+	subLock     sync.RWMutex
+	stop        bool
+	liveTime    time.Time
+	pluginChain *plugins.PluginChain
+	subChans    map[string]chan *rtp.Packet
 }
 
 // NewRouter return a new Router
 func NewRouter(id string) *Router {
 	log.Infof("NewRouter id=%s", id)
-	jb := plugins.NewJitterBuffer(jbPlugin)
-	r := &Router{
-		subs:     make(map[string]transport.Transport),
-		pubCh:    make(chan *rtp.Packet, maxSize),
-		subCh:    make(chan *rtp.Packet, maxSize),
-		liveTime: time.Now().Add(liveCycle),
-		jbRtcpCh: jb.GetRTCPChan(),
+	return &Router{
+		subs:        make(map[string]transport.Transport),
+		liveTime:    time.Now().Add(liveCycle),
+		pluginChain: plugins.NewPluginChain(),
+		subChans:    make(map[string]chan *rtp.Packet),
 	}
-	r.AddPlugin(jbPlugin, jb)
-	r.start()
-	return r
 }
 
-func (r *Router) in() {
-	go func() {
-		defer util.Recover("[Router.in]")
-		count := uint64(0)
-		for {
-			if r.stop {
-				return
-			}
-			pub := r.GetPub()
-			if pub == nil {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			rtp, err := pub.ReadRTP()
-			if err == nil {
-				// log.Infof("rtp.Extension=%t rtp.ExtensionProfile=%x rtp.ExtensionPayload=%x", rtp.Extension, rtp.ExtensionProfile, rtp.ExtensionPayload)
-				r.pubCh <- rtp
-				if count%300 == 0 {
-					r.liveTime = time.Now().Add(liveCycle)
-				}
-				count++
-			} else {
-				log.Errorf("Router.in err=%v", err)
-			}
-		}
-	}()
-}
-
-func (r *Router) handle() {
-	go func() {
-		defer util.Recover("[Router.handle]")
-		count := uint64(0)
-		for {
-			if r.stop {
-				return
-			}
-
-			pkt := <-r.pubCh
-			log.Debugf("pkt := <-r.pubCh %v", pkt)
-			r.subCh <- pkt
-			log.Debugf("r.subCh <- pkt %v", pkt)
-			if pkt == nil {
-				continue
-			}
-			//only buffer video
-			if util.IsVideo(pkt.PayloadType) {
-				if count%3000 == 0 {
-					r.GetPlugin(jbPlugin).(*plugins.JitterBuffer).Init(pkt.SSRC, pkt.PayloadType, r.jbConfig)
-				}
-				r.GetPlugin(jbPlugin).PushRTP(pkt)
-				count++
-			}
-		}
-	}()
-}
-
-func (r *Router) out() {
-	go func() {
-		defer util.Recover("[Router.out]")
-		for {
-			if r.stop {
-				return
-			}
-
-			pkt := <-r.subCh
-			log.Debugf("pkt := <-r.subCh %v", pkt)
-			if pkt == nil {
-				continue
-			}
-			// nonblock sending
-			go func() {
-				for _, t := range r.GetSubs() {
-					if t == nil {
-						log.Errorf("Transport is nil")
-						continue
-					}
-
-					// log.Infof("Router.out WriteRTP %v:%v to %v ", pkt.SSRC, pkt.SequenceNumber, t.ID())
-					if err := t.WriteRTP(pkt); err != nil {
-						log.Errorf("wt.WriteRTP err=%v", err)
-						// del sub when err is increasing
-						if t.WriteErrTotal() > maxWriteErr {
-							r.DelSub(t.ID())
-						}
-					}
-					t.WriteErrReset()
-				}
-			}()
-		}
-	}()
-}
-
-func (r *Router) jitter() {
-	go func() {
-		defer util.Recover("[Router.out]")
-		for {
-			if r.stop {
-				return
-			}
-
-			pkt := <-r.jbRtcpCh
-			switch pkt.(type) {
-			case *rtcp.TransportLayerNack, *rtcp.ReceiverEstimatedMaximumBitrate, *rtcp.PictureLossIndication:
-				log.Infof("Router.jitter r.GetPub().WriteRTCP %v", pkt)
-				if r.pub != nil {
-					r.GetPub().WriteRTCP(pkt)
-				}
-			}
-		}
-	}()
+func (r *Router) InitPlugins(config plugins.Config) error {
+	log.Infof("Router.InitPlugins config=%+v", config)
+	if r.pluginChain != nil {
+		return r.pluginChain.Init(config)
+	}
+	return nil
 }
 
 func (r *Router) start() {
-	r.in()
-	r.out()
-	r.handle()
-	r.jitter()
+	go func() {
+		defer util.Recover("[Router.start]")
+		for {
+			if r.stop {
+				return
+			}
+
+			var pkt *rtp.Packet
+			var err error
+			// get rtp from pluginChain or pub
+			if r.pluginChain != nil && r.pluginChain.On() {
+				pkt = r.pluginChain.ReadRTP()
+			} else {
+				pkt, err = r.pub.ReadRTP()
+				if err != nil {
+					log.Errorf("r.pub.ReadRTP err=%v", err)
+					continue
+				}
+			}
+			// log.Infof("pkt := <-r.subCh %v", pkt)
+			if pkt == nil {
+				continue
+			}
+			r.liveTime = time.Now().Add(liveCycle)
+			r.subLock.RLock()
+			// Push to client send queues
+			for i := range r.GetSubs() {
+				// Nonblock sending
+				select {
+				case r.subChans[i] <- pkt:
+				default:
+					log.Errorf("Sub consumer is backed up. Dropping packet")
+				}
+			}
+			r.subLock.RUnlock()
+		}
+	}()
 }
 
 // AddPub add a pub transport
 func (r *Router) AddPub(id string, t transport.Transport) transport.Transport {
 	log.Infof("AddPub id=%s", id)
 	r.pub = t
-	r.jbConfig = plugins.JitterBufferConfig{
-		RembCycle: 2,
-		PliCycle:  1,
-		Bandwidth: t.GetBandwidth(),
-	}
+	r.pluginChain.AttachPub(t)
+	r.start()
 	return t
 }
 
 // DelPub del pub
 func (r *Router) DelPub() {
 	log.Infof("Router.DelPub %v", r.pub)
-	// first close pub
 	if r.pub != nil {
 		r.pub.Close()
+	}
+	if r.pluginChain != nil {
+		r.pluginChain.Close()
 	}
 	r.pub = nil
 }
@@ -231,25 +136,46 @@ func (r *Router) AddSub(id string, t transport.Transport) transport.Transport {
 	r.subLock.Lock()
 	defer r.subLock.Unlock()
 	r.subs[id] = t
+	r.subChans[id] = make(chan *rtp.Packet, 1000)
 	log.Infof("Router.AddSub id=%s t=%p", id, t)
+	// Sub writer
+	go func() {
+		for pkt := range r.subChans[id] {
+			// log.Infof(" WriteRTP %v:%v to %v ", pkt.SSRC, pkt.SequenceNumber, t.ID())
+			if err := t.WriteRTP(pkt); err != nil {
+				// log.Errorf("wt.WriteRTP err=%v", err)
+				// del sub when err is increasing
+				if t.WriteErrTotal() > maxWriteErr {
+					r.DelSub(t.ID())
+				}
+			}
+			t.WriteErrReset()
+		}
+		log.Infof("Closing sub writer")
+	}()
+
+	// Sub reader
 	go func() {
 		for {
 			pkt := <-t.GetRTCPChan()
 			if r.stop {
 				return
 			}
-			switch pkt.(type) {
+			switch pkt := pkt.(type) {
 			case *rtcp.PictureLossIndication:
-				if r.pub != nil {
+				if r.GetPub() != nil {
 					// Request a Key Frame
 					log.Infof("Router.AddSub got pli: %+v", pkt)
-					r.GetPub().WriteRTCP(pkt)
+					err := r.GetPub().WriteRTCP(pkt)
+					if err != nil {
+						log.Errorf("Router.AddSub pli err => %+v", err)
+					}
 				}
 			case *rtcp.TransportLayerNack:
-				log.Debugf("rtptransport got nack: %+v", pkt)
-				nack := pkt.(*rtcp.TransportLayerNack)
+				// log.Infof("Router.AddSub got nack: %+v", pkt)
+				nack := pkt
 				for _, nackPair := range nack.Nacks {
-					if !r.writeRTP(id, nack.MediaSSRC, nackPair.PacketID) {
+					if !r.ReSendRTP(id, nack.MediaSSRC, nackPair.PacketID) {
 						n := &rtcp.TransportLayerNack{
 							//origin ssrc
 							SenderSSRC: nack.SenderSSRC,
@@ -257,13 +183,15 @@ func (r *Router) AddSub(id string, t transport.Transport) transport.Transport {
 							Nacks:      []rtcp.NackPair{rtcp.NackPair{PacketID: nackPair.PacketID}},
 						}
 						if r.pub != nil {
-							r.GetPub().WriteRTCP(n)
+							err := r.GetPub().WriteRTCP(n)
+							if err != nil {
+								log.Errorf("Router.AddSub nack WriteRTCP err => %+v", err)
+							}
 						}
 					}
 				}
 
 			default:
-				r.PushRTCP(pkt)
 			}
 		}
 	}()
@@ -272,8 +200,8 @@ func (r *Router) AddSub(id string, t transport.Transport) transport.Transport {
 
 // GetSub get a sub by id
 func (r *Router) GetSub(id string) transport.Transport {
-	r.subLock.Lock()
-	defer r.subLock.Unlock()
+	r.subLock.RLock()
+	defer r.subLock.RUnlock()
 	// log.Infof("Router.GetSub id=%s sub=%v", id, r.subs[id])
 	return r.subs[id]
 }
@@ -303,59 +231,25 @@ func (r *Router) DelSub(id string) {
 	if r.subs[id] != nil {
 		r.subs[id].Close()
 	}
+	if r.subChans[id] != nil {
+		close(r.subChans[id])
+	}
 	delete(r.subs, id)
+	delete(r.subChans, id)
 }
 
 // DelSubs del all sub
 func (r *Router) DelSubs() {
 	log.Infof("Router.DelSubs")
-	r.subLock.Lock()
-	defer r.subLock.Unlock()
-	for _, sub := range r.subs {
-		if sub != nil {
-			sub.Close()
-		}
+	r.subLock.RLock()
+	keys := make([]string, 0, len(r.subs))
+	for k := range r.subs {
+		keys = append(keys, k)
 	}
-	r.subs = nil
-}
+	r.subLock.RUnlock()
 
-// AddPlugin add a plugin
-func (r *Router) AddPlugin(id string, i plugins.Plugin) {
-	r.pluginLock.Lock()
-	defer r.pluginLock.Unlock()
-	r.plugins = append(r.plugins, i)
-}
-
-// GetPlugin get plugin by id
-func (r *Router) GetPlugin(id string) plugins.Plugin {
-	r.pluginLock.RLock()
-	defer r.pluginLock.RUnlock()
-	for i := 0; i < len(r.plugins); i++ {
-		if r.plugins[i].ID() == id {
-			return r.plugins[i]
-		}
-	}
-	return nil
-}
-
-// DelPlugin del plugin
-func (r *Router) DelPlugin(id string) {
-	r.pluginLock.Lock()
-	defer r.pluginLock.Unlock()
-	for i := 0; i < len(r.plugins); i++ {
-		if r.plugins[i].ID() == id {
-			r.plugins[i].Stop()
-			r.plugins = append(r.plugins[:i], r.plugins[i+1:]...)
-		}
-	}
-}
-
-// DelPlugins del all plugins
-func (r *Router) DelPlugins() {
-	r.pluginLock.Lock()
-	defer r.pluginLock.Unlock()
-	for _, plugin := range r.plugins {
-		plugin.Stop()
+	for _, id := range keys {
+		r.DelSub(id)
 	}
 }
 
@@ -364,28 +258,31 @@ func (r *Router) Close() {
 	if r.stop {
 		return
 	}
+	log.Infof("Router.Close")
 	r.DelPub()
 	r.stop = true
-	r.DelPlugins()
 	r.DelSubs()
 }
 
-func (r *Router) writeRTP(sid string, ssrc uint32, sn uint16) bool {
+func (r *Router) ReSendRTP(sid string, ssrc uint32, sn uint16) bool {
 	if r.pub == nil {
 		return false
 	}
-	hd := r.GetPlugin(jbPlugin)
+	hd := r.pluginChain.GetPlugin(plugins.TypeJitterBuffer)
 	if hd != nil {
 		jb := hd.(*plugins.JitterBuffer)
 		pkt := jb.GetPacket(ssrc, sn)
 		if pkt == nil {
-			// log.Infof("Router.writeRTP pkt not found sid=%s ssrc=%d sn=%d pkt=%v", sid, ssrc, sn, pkt)
+			// log.Infof("Router.ReSendRTP pkt not found sid=%s ssrc=%d sn=%d pkt=%v", sid, ssrc, sn, pkt)
 			return false
 		}
 		sub := r.GetSub(sid)
 		if sub != nil {
-			sub.WriteRTP(pkt)
-			// log.Infof("Router.writeRTP sid=%s ssrc=%d sn=%d", sid, ssrc, sn)
+			err := sub.WriteRTP(pkt)
+			if err != nil {
+				log.Errorf("router.ReSendRTP err=%v", err)
+			}
+			// log.Infof("Router.ReSendRTP sid=%s ssrc=%d sn=%d", sid, ssrc, sn)
 			return true
 		}
 	}
@@ -394,17 +291,5 @@ func (r *Router) writeRTP(sid string, ssrc uint32, sn uint16) bool {
 
 // Alive return router status
 func (r *Router) Alive() bool {
-	if r.liveTime.Before(time.Now()) {
-		return false
-	}
-	return true
-}
-
-// PushRTCP push rtcp to jitterbuffer
-func (r *Router) PushRTCP(pkt rtcp.Packet) error {
-	jbPlugin := r.GetPlugin(jbPlugin)
-	if jbPlugin == nil {
-		return errInvalidPlugin
-	}
-	return jbPlugin.PushRTCP(pkt)
+	return !r.liveTime.Before(time.Now())
 }
